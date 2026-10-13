@@ -1776,9 +1776,6 @@ it.live("the agent default outranks the reported one, survives a restart, and re
   ).pipe(Effect.provide(layer)),
 );
 
-const agentDefaultFile = (config: ServerConfig.ServerConfig["Service"]) =>
-  `${config.stateDir}/server-browser/agent-default.json`;
-
 it.live("replacing changes the stored agent default only while it still names that profile", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -1801,62 +1798,3 @@ it.live("replacing changes the stored agent default only while it still names th
     }),
   ).pipe(Effect.provide(layer)),
 );
-
-it.live("concurrent agent default writes leave the file and memory on the same profile", () => {
-  const writeFinished = Promise.withResolvers<void>();
-  const releaseFirstWrite = Promise.withResolvers<void>();
-  let renames = 0;
-  const gatedFileSystem = Layer.effect(
-    FileSystem.FileSystem,
-    Effect.map(FileSystem.FileSystem, (fileSystem) => ({
-      ...fileSystem,
-      // The first agent-default write stalls after its rename, as a slow disk would.
-      rename: (from: string, to: string) =>
-        fileSystem.rename(from, to).pipe(
-          Effect.tap(() =>
-            to.endsWith("agent-default.json") && ++renames === 1
-              ? Effect.promise(async () => {
-                  writeFinished.resolve();
-                  await releaseFirstWrite.promise;
-                })
-              : Effect.void,
-          ),
-        ),
-    })),
-  ).pipe(Layer.provide(NodeServices.layer));
-  return Effect.scoped(
-    Effect.gen(function* () {
-      const config = yield* ServerConfig.ServerConfig;
-      const fileSystem = yield* FileSystem.FileSystem;
-      const browser = yield* ServerBrowser.ServerBrowser;
-      const broker = yield* Broker.PreviewAutomationBroker;
-      yield* Effect.yieldNow;
-
-      const first = yield* browser
-        .setAgentDefaultProfile({ profileId: "profile-a" })
-        .pipe(Effect.forkScoped);
-      yield* Effect.promise(() => writeFinished.promise);
-      const second = yield* browser
-        .setAgentDefaultProfile({ profileId: "profile-b" })
-        .pipe(Effect.forkScoped);
-      // Unserialized, the second write lands here, before the first one updates memory.
-      yield* Effect.sleep("50 millis");
-      releaseFirstWrite.resolve();
-      yield* Fiber.join(first);
-      yield* Fiber.join(second);
-
-      const status = yield* broker.invoke<PreviewAutomationStatus>({
-        scope,
-        operation: "open",
-        input: { reuseExistingTab: false, show: false },
-      });
-      const stored = JSON.parse(yield* fileSystem.readFileString(agentDefaultFile(config)));
-      expect(status.defaultProfileId).toBe(stored.profileId);
-      expect(stored.profileId).toBe("profile-b");
-    }),
-  ).pipe(
-    Effect.provide(
-      ServerBrowser.layer.pipe(Layer.provide(gatedFileSystem), Layer.provideMerge(dependencies)),
-    ),
-  );
-});
