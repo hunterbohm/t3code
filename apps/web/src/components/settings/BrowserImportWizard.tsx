@@ -614,6 +614,9 @@ function DoneStep({
   readonly destinationEnvironmentName: string;
   readonly onClose: () => void;
 }) {
+  const environmentRows = environments.filter(
+    (result) => result.cookies !== "notSelected" || result.defaultFailed,
+  );
   return (
     <>
       <DialogHeader>
@@ -632,26 +635,33 @@ function DoneStep({
               : `There were no cookies to import for ${destinationEnvironmentName}.`}
         </DialogDescription>
       </DialogHeader>
-      {environments.length > 0 ? (
+      {environmentRows.length > 0 ? (
         <DialogPanel>
           <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
             Agents
           </p>
           <ul className="mt-1 space-y-1">
-            {environments.map((result) => (
+            {environmentRows.map((result) => (
               <li
                 key={result.environmentId}
                 className="flex items-center justify-between gap-3 text-sm"
               >
                 <span className="truncate">{result.name}</span>
-                {result.status === "failed" ? (
-                  <span className="shrink-0 text-destructive">Couldn&rsquo;t import</span>
-                ) : (
-                  <span className="shrink-0 tabular-nums text-muted-foreground">
-                    {cookieResultCount(result.imported)}
-                    {result.skipped > 0 ? `, ${result.skipped.toLocaleString()} skipped` : ""}
-                  </span>
-                )}
+                <span className="shrink-0 text-right tabular-nums">
+                  {result.cookies === "failed" ? (
+                    <span className="text-destructive">Couldn&rsquo;t import</span>
+                  ) : result.cookies === "notSelected" ? null : (
+                    <span className="text-muted-foreground">
+                      {cookieResultCount(result.cookies.imported)}
+                      {result.cookies.skipped > 0
+                        ? `, ${result.cookies.skipped.toLocaleString()} skipped`
+                        : ""}
+                    </span>
+                  )}
+                  {result.defaultFailed ? (
+                    <span className="ml-2 text-destructive">Default not set</span>
+                  ) : null}
+                </span>
               </li>
             ))}
           </ul>

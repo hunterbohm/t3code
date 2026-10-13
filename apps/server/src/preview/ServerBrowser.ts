@@ -12,6 +12,7 @@ import {
   type PreviewReportProfilesInput,
   type PreviewImportCookiesInput,
   type PreviewImportCookiesResult,
+  type PreviewSetAgentDefaultProfileInput,
   PREVIEW_AUTOMATION_SERVER_OPERATIONS,
   PreviewViewportSetting as PreviewViewportSettingSchema,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
@@ -66,6 +67,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import type * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import type {
@@ -270,10 +272,11 @@ export class ServerBrowser extends Context.Service<
     /**
      * Sets the profile `preview_open` uses when the agent names none. Unlike a
      * reported default, it is kept across restarts. Null removes it, and the
-     * reported default applies again.
+     * reported default applies again. With `replacing`, nothing changes unless
+     * that profile is the stored default.
      */
     readonly setAgentDefaultProfile: (
-      profileId: string | null,
+      input: PreviewSetAgentDefaultProfileInput,
     ) => Effect.Effect<void, PreviewSetAgentDefaultProfileError>;
   }
 >()("t3/preview/ServerBrowser") {}
@@ -499,9 +502,9 @@ const CLIPBOARD_SCRIPT = `(() => {
   };
 })();`;
 
-const decodeAgentDefault = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(Schema.Struct({ profileId: BrowserProfileId })),
-);
+const AgentDefaultFile = Schema.fromJsonString(Schema.Struct({ profileId: BrowserProfileId }));
+const decodeAgentDefault = Schema.decodeUnknownEffect(AgentDefaultFile);
+const encodeAgentDefault = Schema.encodeSync(AgentDefaultFile);
 
 const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
@@ -1331,20 +1334,31 @@ const make = Effect.gen(function* () {
   const effectiveDefaultProfileId = () =>
     agentDefaultProfileId ?? reportedProfiles?.defaultProfileId;
 
-  const setAgentDefaultProfile: ServerBrowser["Service"]["setAgentDefaultProfile"] = (profileId) =>
-    (profileId === null
-      ? fileSystem.remove(agentDefaultPath, { force: true })
-      : writeFileStringAtomically({
-          filePath: agentDefaultPath,
-          contents: `${JSON.stringify({ profileId })}\n`,
-        }).pipe(
-          Effect.provideService(FileSystem.FileSystem, fileSystem),
-          Effect.provideService(Path.Path, pathService),
-        )
-    ).pipe(
-      Effect.tap(() => Effect.sync(() => void (agentDefaultProfileId = profileId))),
-      Effect.mapError((cause) => new PreviewSetAgentDefaultProfileError({ cause })),
-    );
+  /** The file and the in-memory id change together, so concurrent calls cannot leave them apart. */
+  const agentDefaultLock = yield* Semaphore.make(1);
+
+  const setAgentDefaultProfile: ServerBrowser["Service"]["setAgentDefaultProfile"] = ({
+    profileId,
+    replacing,
+  }) =>
+    agentDefaultLock
+      .withPermits(1)(
+        Effect.suspend(() =>
+          replacing !== undefined && agentDefaultProfileId !== replacing
+            ? Effect.void
+            : (profileId === null
+                ? fileSystem.remove(agentDefaultPath, { force: true })
+                : writeFileStringAtomically({
+                    filePath: agentDefaultPath,
+                    contents: `${encodeAgentDefault({ profileId })}\n`,
+                  }).pipe(
+                    Effect.provideService(FileSystem.FileSystem, fileSystem),
+                    Effect.provideService(Path.Path, pathService),
+                  )
+              ).pipe(Effect.tap(() => Effect.sync(() => void (agentDefaultProfileId = profileId)))),
+        ),
+      )
+      .pipe(Effect.mapError((cause) => new PreviewSetAgentDefaultProfileError({ cause })));
 
   const profileStatus = () => {
     const profiles = reportedProfiles?.profiles ?? BUILT_IN_BROWSER_PROFILES;

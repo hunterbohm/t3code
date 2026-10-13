@@ -339,6 +339,8 @@ export type PreviewImportCookiesResult = typeof PreviewImportCookiesResult.Type;
  */
 export const PreviewSetAgentDefaultProfileInput = Schema.Struct({
   profileId: Schema.NullOr(BrowserProfileId),
+  /** Applies only while this is the server's stored default; otherwise nothing changes. */
+  replacing: Schema.optional(BrowserProfileId),
 });
 export type PreviewSetAgentDefaultProfileInput = typeof PreviewSetAgentDefaultProfileInput.Type;
 

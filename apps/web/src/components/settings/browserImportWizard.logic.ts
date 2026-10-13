@@ -15,12 +15,17 @@ export interface ImportDestination {
   readonly name: string;
 }
 
-/** How one environment's browser fared. Only its own row fails when it cannot be reached. */
-export type EnvironmentImportResult = ImportDestination &
-  (
-    | { readonly status: "imported"; readonly imported: number; readonly skipped: number }
-    | { readonly status: "failed" }
-  );
+/**
+ * How one environment's browser fared. Only its own row fails when it cannot
+ * be reached, and the default can fail while the cookies arrive.
+ */
+export interface EnvironmentImportResult extends ImportDestination {
+  readonly cookies:
+    | { readonly imported: number; readonly skipped: number }
+    | "failed"
+    | "notSelected";
+  readonly defaultFailed: boolean;
+}
 
 export type WizardTarget =
   | { readonly kind: "new"; readonly profileId: string }
@@ -249,33 +254,67 @@ export function batchCookies<T>(
 }
 
 /**
- * Sends the cookies to each destination in batches. Destinations run side by
- * side; one that rejects fails its own row and leaves the others alone.
+ * Runs `action` on each destination and returns the names of those where it
+ * rejected. Every destination is awaited.
  */
-export function forwardCookies<C>(input: {
+export async function failedDestinationNames(
+  destinations: ReadonlyArray<ImportDestination>,
+  action: (environmentId: EnvironmentId) => Promise<void>,
+): Promise<ReadonlyArray<string>> {
+  const outcomes = await Promise.all(
+    destinations.map(({ environmentId, name }) =>
+      action(environmentId).then(
+        () => undefined,
+        () => name,
+      ),
+    ),
+  );
+  return outcomes.filter((name) => name !== undefined);
+}
+
+/**
+ * Brings each destination up to date: the selected ones get the cookies in
+ * batches, and with `makeDefault` every one gets the agent default, after its
+ * cookies. Resolves only once every environment has acknowledged or failed.
+ * Destinations run side by side; one that rejects fails its own row.
+ */
+export function syncDestinations<C>(input: {
+  /** Every environment that can take an agent default. */
   readonly destinations: ReadonlyArray<ImportDestination>;
+  readonly selected: ReadonlySet<EnvironmentId>;
   readonly cookies: ReadonlyArray<C>;
   readonly batchSize: number;
   readonly send: (
     environmentId: EnvironmentId,
     batch: ReadonlyArray<C>,
   ) => Promise<{ readonly imported: number; readonly skipped: number }>;
+  readonly setDefault: ((environmentId: EnvironmentId) => Promise<void>) | undefined;
 }): Promise<ReadonlyArray<EnvironmentImportResult>> {
   const batches = batchCookies(input.cookies, input.batchSize);
   return Promise.all(
     input.destinations.map(async (destination): Promise<EnvironmentImportResult> => {
-      let imported = 0;
-      let skipped = 0;
-      try {
-        for (const batch of batches) {
-          const result = await input.send(destination.environmentId, batch);
-          imported += result.imported;
-          skipped += result.skipped;
+      let cookies: EnvironmentImportResult["cookies"] = "notSelected";
+      if (input.selected.has(destination.environmentId)) {
+        let imported = 0;
+        let skipped = 0;
+        try {
+          for (const batch of batches) {
+            const result = await input.send(destination.environmentId, batch);
+            imported += result.imported;
+            skipped += result.skipped;
+          }
+          cookies = { imported, skipped };
+        } catch {
+          cookies = "failed";
         }
-      } catch {
-        return { ...destination, status: "failed" };
       }
-      return { ...destination, status: "imported", imported, skipped };
+      const defaultFailed =
+        input.setDefault !== undefined &&
+        (await input.setDefault(destination.environmentId).then(
+          () => false,
+          () => true,
+        ));
+      return { ...destination, cookies, defaultFailed };
     }),
   );
 }

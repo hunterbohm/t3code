@@ -131,7 +131,8 @@ import { useSettingsScope } from "./SettingsScopeContext";
 import { BrowserImportWizard, type WizardTarget } from "./BrowserImportWizard";
 import {
   desktopPartitionEnvironmentIds,
-  forwardCookies,
+  failedDestinationNames,
+  syncDestinations,
   operableServerBrowserEnvironments,
   type ImportDestination,
   type ImportOutcome,
@@ -1033,19 +1034,26 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
   const resolvedDefaultId =
     findBrowserProfile(listedProfiles, defaultProfileId)?.id ?? DEFAULT_BROWSER_PROFILE_ID;
 
+  const setAgentDefaultOn = async (
+    environmentId: EnvironmentId,
+    input: { readonly profileId: string | null; readonly replacing?: string },
+  ) => {
+    const result = await runSetAgentDefault({ environmentId, input });
+    if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+  };
+
   /** Agents on every environment with a server browser open this profile by default. */
-  const setAgentDefault = async (profileId: string) => {
-    const outcomes = await Promise.all(
-      serverBrowserDestinations.map(async ({ environmentId, name }) => {
-        const result = await runSetAgentDefault({ environmentId, input: { profileId } });
-        return result._tag === "Success" ? undefined : name;
-      }),
+  const setAgentDefault = async (
+    input: { readonly profileId: string | null; readonly replacing?: string },
+    failureTitle = "Could not set the default profile for agents",
+  ) => {
+    const failed = await failedDestinationNames(serverBrowserDestinations, (environmentId) =>
+      setAgentDefaultOn(environmentId, input),
     );
-    const failed = outcomes.filter((name) => name !== undefined);
     if (failed.length > 0) {
       toastManager.add({
         type: "error",
-        title: "Could not set the default profile for agents",
+        title: failureTitle,
         description: `Failed on ${failed.join(", ")}.`,
       });
     }
@@ -1132,9 +1140,11 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
         ? { browserDefaultProfileId: DEFAULT_BROWSER_PROFILE_ID }
         : {}),
     });
-    if (currentSettings.browserDefaultProfileId === id) {
-      void setAgentDefault(DEFAULT_BROWSER_PROFILE_ID);
-    }
+    // Each server resets only if it still names this profile, whatever this client's default was.
+    await setAgentDefault(
+      { profileId: DEFAULT_BROWSER_PROFILE_ID, replacing: id },
+      "Could not reset the default profile for agents",
+    );
     setProfileRemovalInFlight(false);
     setProfilePendingRemoval(null);
   };
@@ -1272,8 +1282,9 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
       // A new profile with nothing imported was never saved, so servers get no copy of it.
       const targetProfileId = input.target.profileId;
       const environmentResults = profileKept
-        ? await forwardCookies({
-            destinations: input.destinations,
+        ? await syncDestinations({
+            destinations: serverBrowserDestinations,
+            selected: new Set(input.destinations.map(({ environmentId }) => environmentId)),
             cookies: result.cookies ?? [],
             batchSize: PREVIEW_IMPORT_COOKIES_MAX_BATCH,
             send: async (destinationId, batch) => {
@@ -1284,9 +1295,11 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
               if (outcome._tag === "Failure") throw squashAtomCommandFailure(outcome);
               return outcome.value;
             },
+            setDefault: input.makeDefault
+              ? (destinationId) => setAgentDefaultOn(destinationId, { profileId: targetProfileId })
+              : undefined,
           })
         : [];
-      if (profileKept && input.makeDefault) void setAgentDefault(targetProfileId);
       return {
         kind: "imported",
         imported: result.imported,
@@ -1459,7 +1472,7 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
                     onClick={() => {
                       if (settingsHydrated) {
                         updateSettings({ browserDefaultProfileId: profile.id });
-                        void setAgentDefault(profile.id);
+                        void setAgentDefault({ profileId: profile.id });
                       }
                     }}
                   >

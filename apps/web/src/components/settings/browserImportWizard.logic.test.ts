@@ -5,7 +5,8 @@ import {
   batchCookies,
   canCloseWizard,
   desktopPartitionEnvironmentIds,
-  forwardCookies,
+  failedDestinationNames,
+  syncDestinations,
   operableServerBrowserEnvironments,
   resolveMakeDefault,
   selectedDestinations,
@@ -289,8 +290,10 @@ describe("forwarding cookies to environments", () => {
 
   it("sums each environment's batches and fails only the one that rejects", async () => {
     const sent: Array<[string, number]> = [];
-    const results = await forwardCookies({
-      destinations: ["near", "far"].map(destination),
+    const everyone = ["near", "far"].map(destination);
+    const results = await syncDestinations({
+      destinations: everyone,
+      selected: new Set(everyone.map(({ environmentId }) => environmentId)),
       cookies: [1, 2, 3, 4, 5],
       batchSize: 2,
       send: async (environmentId, batch) => {
@@ -298,11 +301,12 @@ describe("forwarding cookies to environments", () => {
         if (environmentId === "far") throw new Error("unreachable");
         return { imported: batch.length - 1, skipped: 1 };
       },
+      setDefault: undefined,
     });
 
     expect(results).toEqual([
-      { ...destination("near"), status: "imported", imported: 2, skipped: 3 },
-      { ...destination("far"), status: "failed" },
+      { ...destination("near"), cookies: { imported: 2, skipped: 3 }, defaultFailed: false },
+      { ...destination("far"), cookies: "failed", defaultFailed: false },
     ]);
     expect(sent.filter(([id]) => id === "near")).toEqual([
       ["near", 2],
@@ -310,5 +314,75 @@ describe("forwarding cookies to environments", () => {
       ["near", 1],
     ]);
     expect(sent.filter(([id]) => id === "far")).toEqual([["far", 2]]);
+  });
+
+  it("sets the default on every environment, after its cookies, and reports only the failures", async () => {
+    const events: string[] = [];
+    const everyone = ["on", "off", "down"].map(destination);
+    const results = await syncDestinations({
+      destinations: everyone,
+      selected: new Set([env("on"), env("down")]),
+      cookies: [1],
+      batchSize: 2,
+      send: async (environmentId) => {
+        events.push(`cookies:${environmentId}`);
+        return { imported: 1, skipped: 0 };
+      },
+      setDefault: async (environmentId) => {
+        events.push(`default:${environmentId}`);
+        if (environmentId === "down") throw new Error("unreachable");
+      },
+    });
+
+    expect(results).toEqual([
+      { ...destination("on"), cookies: { imported: 1, skipped: 0 }, defaultFailed: false },
+      { ...destination("off"), cookies: "notSelected", defaultFailed: false },
+      { ...destination("down"), cookies: { imported: 1, skipped: 0 }, defaultFailed: true },
+    ]);
+    expect(events.indexOf("cookies:on")).toBeLessThan(events.indexOf("default:on"));
+    expect(events.indexOf("cookies:down")).toBeLessThan(events.indexOf("default:down"));
+    expect(events).toContain("default:off");
+  });
+
+  it("does not finish until every environment has acknowledged its default", async () => {
+    let acknowledge!: () => void;
+    const acknowledged = new Promise<void>((resolve) => {
+      acknowledge = resolve;
+    });
+    let finished = false;
+    const done = syncDestinations({
+      destinations: [destination("slow")],
+      selected: new Set([env("slow")]),
+      cookies: [],
+      batchSize: 2,
+      send: async () => ({ imported: 0, skipped: 0 }),
+      setDefault: () => acknowledged,
+    }).then((results) => {
+      finished = true;
+      return results;
+    });
+
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(finished).toBe(false);
+    acknowledge();
+    expect((await done)[0]?.defaultFailed).toBe(false);
+    expect(finished).toBe(true);
+  });
+});
+
+describe("failedDestinationNames", () => {
+  it("awaits every environment and names the ones that rejected", async () => {
+    const reached: string[] = [];
+    const failed = await failedDestinationNames(
+      ["a", "b", "c"].map(destination),
+      async (environmentId) => {
+        await Promise.resolve();
+        reached.push(environmentId);
+        if (environmentId !== "b") throw new Error("down");
+      },
+    );
+    expect(failed).toEqual(["a", "c"]);
+    expect(reached.toSorted()).toEqual(["a", "b", "c"]);
   });
 });
