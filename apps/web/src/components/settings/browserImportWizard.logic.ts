@@ -1,9 +1,26 @@
-import type { BrowserImportFailureReason, BrowserImportSource } from "@t3tools/contracts";
+import type {
+  BrowserImportFailureReason,
+  BrowserImportSource,
+  EnvironmentId,
+} from "@t3tools/contracts";
 
 export interface WizardTargetProfile {
   readonly id: string;
   readonly name: string;
 }
+
+/** An environment whose own browser can take imported sign-ins. */
+export interface ImportDestination {
+  readonly environmentId: EnvironmentId;
+  readonly name: string;
+}
+
+/** How one environment's browser fared. Only its own row fails when it cannot be reached. */
+export type EnvironmentImportResult = ImportDestination &
+  (
+    | { readonly status: "imported"; readonly imported: number; readonly skipped: number }
+    | { readonly status: "failed" }
+  );
 
 export type WizardTarget =
   | { readonly kind: "new"; readonly profileId: string }
@@ -49,6 +66,7 @@ export type ImportOutcome =
       readonly skipped: number;
       readonly skippedDomains: ReadonlyArray<string>;
       readonly targetName: string;
+      readonly environments: ReadonlyArray<EnvironmentImportResult>;
     }
   | { readonly kind: "blocked"; readonly reason: BrowserImportFailureReason };
 
@@ -72,6 +90,7 @@ export type WizardStep =
       readonly skipped: number;
       readonly skippedDomains: ReadonlyArray<string>;
       readonly targetName: string;
+      readonly environments: ReadonlyArray<EnvironmentImportResult>;
     }
   | { readonly step: "blocked"; readonly reason: BrowserImportFailureReason };
 
@@ -104,6 +123,7 @@ export function outcomeToStep(outcome: ImportOutcome): WizardStep {
       skipped: outcome.skipped,
       skippedDomains: outcome.skippedDomains,
       targetName: outcome.targetName,
+      environments: outcome.environments,
     };
   }
   // A browser that reopened mid-import routes back to the quit screen; every
@@ -171,4 +191,91 @@ export function formatSkippedDomains(domains: ReadonlyArray<string>): string {
   if (domains.length === 1) return domains[0]!;
   if (domains.length <= 3) return `${domains.slice(0, -1).join(", ")} and ${domains.at(-1)}`;
   return `${domains.slice(0, 3).join(", ")} and ${domains.length - 3} more`;
+}
+
+/** Environments an import can reach: their browser runs on the server and this client may operate it. */
+export function operableServerBrowserEnvironments<
+  T extends { readonly environmentId: EnvironmentId },
+>(
+  environments: ReadonlyArray<T>,
+  hasServerBrowser: (environmentId: EnvironmentId) => boolean,
+  operable: ReadonlySet<EnvironmentId>,
+): ReadonlyArray<T> {
+  return environments.filter(
+    ({ environmentId }) => hasServerBrowser(environmentId) && operable.has(environmentId),
+  );
+}
+
+/** Every destination is on until the user turns it off. */
+export function selectedDestinations(
+  destinations: ReadonlyArray<ImportDestination>,
+  excluded: ReadonlySet<EnvironmentId>,
+): ReadonlyArray<ImportDestination> {
+  return destinations.filter(({ environmentId }) => !excluded.has(environmentId));
+}
+
+/**
+ * The environments whose desktop partitions receive the cookies. The primary
+ * is always written, because its tabs are the ones this window renders; a
+ * remote destination's partition lets the desktop's own tabs for it sign in too.
+ */
+export function desktopPartitionEnvironmentIds(
+  primary: EnvironmentId,
+  selected: ReadonlyArray<ImportDestination>,
+): readonly [EnvironmentId, ...ReadonlyArray<EnvironmentId>] {
+  return [
+    primary,
+    ...selected.map(({ environmentId }) => environmentId).filter((id) => id !== primary),
+  ];
+}
+
+/** A new profile becomes the default unless the user said otherwise. */
+export function resolveMakeDefault(
+  choice: boolean | undefined,
+  selection: WizardTargetSelection,
+): boolean {
+  return choice ?? selection.kind === "new";
+}
+
+export function batchCookies<T>(
+  cookies: ReadonlyArray<T>,
+  size: number,
+): ReadonlyArray<ReadonlyArray<T>> {
+  const batches: Array<ReadonlyArray<T>> = [];
+  for (let start = 0; start < cookies.length; start += size) {
+    batches.push(cookies.slice(start, start + size));
+  }
+  return batches;
+}
+
+/**
+ * Sends the cookies to each destination in batches. Destinations run side by
+ * side; one that rejects fails its own row and leaves the others alone.
+ */
+export function forwardCookies<C>(input: {
+  readonly destinations: ReadonlyArray<ImportDestination>;
+  readonly cookies: ReadonlyArray<C>;
+  readonly batchSize: number;
+  readonly send: (
+    environmentId: EnvironmentId,
+    batch: ReadonlyArray<C>,
+  ) => Promise<{ readonly imported: number; readonly skipped: number }>;
+}): Promise<ReadonlyArray<EnvironmentImportResult>> {
+  const batches = batchCookies(input.cookies, input.batchSize);
+  return Promise.all(
+    input.destinations.map(async (destination): Promise<EnvironmentImportResult> => {
+      let imported = 0;
+      let skipped = 0;
+      try {
+        for (const batch of batches) {
+          const result = await input.send(destination.environmentId, batch);
+          imported += result.imported;
+          skipped += result.skipped;
+        }
+      } catch {
+        return { ...destination, status: "failed" };
+      }
+      return { ...destination, status: "imported", imported, skipped };
+    }),
+  );
 }

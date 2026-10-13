@@ -12,6 +12,7 @@ import { DeviceHostsSettings } from "./DeviceHostsSettings";
  * @module IntegrationsSettings
  */
 import {
+  AuthPreviewOperateScope,
   AuthSettingsWriteScope,
   BrowserImportFailureReason,
   BROWSER_PROFILE_MAX_COUNT,
@@ -28,6 +29,7 @@ import {
   DEFAULT_PREVIEW_APPEARANCE,
   DEFAULT_PREVIEW_ZOOM_FACTOR,
   FILL_PREVIEW_VIEWPORT,
+  PREVIEW_IMPORT_COOKIES_MAX_BATCH,
   PREVIEW_VIEWPORT_MAX_AREA,
   PREVIEW_VIEWPORT_MAX_DIMENSION,
   PREVIEW_VIEWPORT_MIN_DIMENSION,
@@ -36,9 +38,12 @@ import {
   isBuiltInBrowserProfileId,
   resolveBrowserProfiles,
   type BrowserImportSource,
+  type BrowserImportedCookie,
   type PreviewAppearancePreference,
+  type PreviewImportedCookie,
   type PreviewViewportSetting,
 } from "@t3tools/contracts";
+import * as Redacted from "effect/Redacted";
 import { PREVIEW_VIEWPORT_PRESETS } from "@t3tools/shared/previewViewport";
 import { MoreVertical, Plus as PlusIcon } from "lucide-react";
 import { useCallback, useRef, useState } from "react";
@@ -50,7 +55,11 @@ import { previewBridge } from "~/components/preview/previewBridge";
 import { cn, randomUUID } from "~/lib/utils";
 import { useEnvironments, usePrimaryEnvironment } from "~/state/environments";
 import { deviceEnvironment, useDeviceState } from "~/state/device";
-import { readEnvironmentScope, useEnvironmentScope } from "~/state/session";
+import {
+  readEnvironmentScope,
+  useEnvironmentScope,
+  useEnvironmentsWithScope,
+} from "~/state/session";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { previewEnvironment } from "~/state/preview";
 import { useServerConfigs } from "~/state/entities";
@@ -120,7 +129,13 @@ import { searchableSetting } from "./settingsSearch";
 import { ProjectDefaultsSettings } from "./ProjectDefaultsSettings";
 import { useSettingsScope } from "./SettingsScopeContext";
 import { BrowserImportWizard, type WizardTarget } from "./BrowserImportWizard";
-import type { ImportOutcome } from "./browserImportWizard.logic";
+import {
+  desktopPartitionEnvironmentIds,
+  forwardCookies,
+  operableServerBrowserEnvironments,
+  type ImportDestination,
+  type ImportOutcome,
+} from "./browserImportWizard.logic";
 
 const FILL_VALUE = "fill";
 const RESPONSIVE_VALUE = "responsive";
@@ -202,6 +217,11 @@ export const importFailureReason = (cause: unknown): BrowserImportFailureReason 
     "readFailed"
   );
 };
+
+const toWireCookie = (cookie: BrowserImportedCookie): PreviewImportedCookie => ({
+  ...cookie,
+  value: Redacted.make(cookie.value),
+});
 
 const viewportSelectValue = (viewport: PreviewViewportSetting): string => {
   if (viewport._tag === "fill") return FILL_VALUE;
@@ -961,6 +981,27 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
   const runClearServerProfile = useAtomCommand(previewEnvironment.clearProfile, {
     reportFailure: false,
   });
+  const runImportServerCookies = useAtomCommand(previewEnvironment.importCookies, {
+    reportFailure: false,
+  });
+  const runSetAgentDefault = useAtomCommand(previewEnvironment.setAgentDefaultProfile, {
+    reportFailure: false,
+  });
+  const operableEnvironmentIds = useEnvironmentsWithScope(environments, AuthPreviewOperateScope);
+  const serverBrowserDestinations: ReadonlyArray<ImportDestination> =
+    operableServerBrowserEnvironments(
+      environments,
+      (environmentId) =>
+        serverConfigs.get(environmentId)?.environment.capabilities.serverBrowser === true,
+      operableEnvironmentIds,
+    ).map(({ environmentId, label }) => ({
+      environmentId,
+      name: resolveEnvironmentOptionLabel({
+        isPrimary: environmentId === primaryEnvironment?.environmentId,
+        environmentId,
+        runtimeLabel: label,
+      }),
+    }));
   const serverProfileData: ServerProfileData = {
     environmentIds: environments
       .map((environment) => environment.environmentId)
@@ -991,6 +1032,24 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
   const listedProfiles = profiles.filter((profile) => profile.kind !== "incognito");
   const resolvedDefaultId =
     findBrowserProfile(listedProfiles, defaultProfileId)?.id ?? DEFAULT_BROWSER_PROFILE_ID;
+
+  /** Agents on every environment with a server browser open this profile by default. */
+  const setAgentDefault = async (profileId: string) => {
+    const outcomes = await Promise.all(
+      serverBrowserDestinations.map(async ({ environmentId, name }) => {
+        const result = await runSetAgentDefault({ environmentId, input: { profileId } });
+        return result._tag === "Success" ? undefined : name;
+      }),
+    );
+    const failed = outcomes.filter((name) => name !== undefined);
+    if (failed.length > 0) {
+      toastManager.add({
+        type: "error",
+        title: "Could not set the default profile for agents",
+        description: `Failed on ${failed.join(", ")}.`,
+      });
+    }
+  };
 
   const createProfile = (baseName: string) => {
     if (!settingsHydrated || importInFlightRef.current) return undefined;
@@ -1073,6 +1132,9 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
         ? { browserDefaultProfileId: DEFAULT_BROWSER_PROFILE_ID }
         : {}),
     });
+    if (currentSettings.browserDefaultProfileId === id) {
+      void setAgentDefault(DEFAULT_BROWSER_PROFILE_ID);
+    }
     setProfileRemovalInFlight(false);
     setProfilePendingRemoval(null);
   };
@@ -1104,7 +1166,12 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
   const runWizardImport = async (
     source: BrowserImportSource,
     environmentId: EnvironmentId,
-    input: { readonly sourceProfileDirectory: string; readonly target: WizardTarget },
+    input: {
+      readonly sourceProfileDirectory: string;
+      readonly target: WizardTarget;
+      readonly destinations: ReadonlyArray<ImportDestination>;
+      readonly makeDefault: boolean;
+    },
   ): Promise<ImportOutcome> => {
     if (!previewBridge) return { kind: "blocked", reason: "sessionUnavailable" };
     if (!settingsHydrated) return { kind: "blocked", reason: "sessionUnavailable" };
@@ -1120,11 +1187,16 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
     importInFlightRef.current = true;
     setImportInFlight(true);
     try {
-      const result = await previewBridge.importBrowserCookies({
+      const partitionEnvironmentIds = desktopPartitionEnvironmentIds(
         environmentId,
+        input.destinations,
+      );
+      const result = await previewBridge.importBrowserCookies({
+        environmentIds: partitionEnvironmentIds,
         sourceId: source.id,
         sourceProfileDirectory: input.sourceProfileDirectory,
         targetProfileId: input.target.profileId,
+        returnCookies: input.destinations.length > 0,
       });
       if (
         input.target.kind === "existing" &&
@@ -1135,6 +1207,7 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
         return { kind: "blocked", reason: "readFailed" };
       }
       let targetName: string;
+      let profileKept = true;
       if (input.target.kind === "new") {
         // Registered only when something actually came over: an import that
         // found no cookies should not leave a new, empty profile behind.
@@ -1144,7 +1217,11 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
               const existing = current.browserProfiles.find(
                 (profile) => profile.id === input.target.profileId,
               );
-              if (existing) return current;
+              if (existing) {
+                return input.makeDefault
+                  ? { ...current, browserDefaultProfileId: input.target.profileId }
+                  : current;
+              }
               // The wizard refuses a new target at the cap, but the cap can be
               // reached while the import runs; the updater sees the newest
               // settings, so this is the check that holds.
@@ -1162,6 +1239,7 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
                   ...current.browserProfiles,
                   { id: input.target.profileId, name, kind: "persistent" as const },
                 ],
+                ...(input.makeDefault ? { browserDefaultProfileId: input.target.profileId } : {}),
               };
             });
             targetName =
@@ -1173,7 +1251,7 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
             // cookies behind a profile that disappears on restart.
             await clearBrowserProfileData(
               previewBridge,
-              [environmentId],
+              partitionEnvironmentIds,
               input.target.profileId,
             ).catch(() => undefined);
             // Not a read failure: the cookies came over and were cleared again
@@ -1184,17 +1262,38 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
             throw new Error(`Importing cookies from ${source.id} failed: ${reason}.`, { cause });
           }
         } else {
+          profileKept = false;
           targetName = source.name;
         }
       } else {
         targetName = input.target.name;
+        if (input.makeDefault) updateSettings({ browserDefaultProfileId: input.target.profileId });
       }
+      // A new profile with nothing imported was never saved, so servers get no copy of it.
+      const targetProfileId = input.target.profileId;
+      const environmentResults = profileKept
+        ? await forwardCookies({
+            destinations: input.destinations,
+            cookies: result.cookies ?? [],
+            batchSize: PREVIEW_IMPORT_COOKIES_MAX_BATCH,
+            send: async (destinationId, batch) => {
+              const outcome = await runImportServerCookies({
+                environmentId: destinationId,
+                input: { profileId: targetProfileId, cookies: batch.map(toWireCookie) },
+              });
+              if (outcome._tag === "Failure") throw squashAtomCommandFailure(outcome);
+              return outcome.value;
+            },
+          })
+        : [];
+      if (profileKept && input.makeDefault) void setAgentDefault(targetProfileId);
       return {
         kind: "imported",
         imported: result.imported,
         skipped: result.skipped,
         skippedDomains: result.skippedDomains,
         targetName,
+        environments: environmentResults,
       };
     } catch (cause) {
       return { kind: "blocked", reason: importFailureReason(cause) };
@@ -1360,6 +1459,7 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
                     onClick={() => {
                       if (settingsHydrated) {
                         updateSettings({ browserDefaultProfileId: profile.id });
+                        void setAgentDefault(profile.id);
                       }
                     }}
                   >
@@ -1487,6 +1587,7 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
           destinationEnvironmentName={importSession.environmentName}
           targetProfiles={listedProfiles.map((profile) => ({ id: profile.id, name: profile.name }))}
           canCreateProfile={settingsHydrated && !atProfileLimit}
+          destinations={serverBrowserDestinations}
           onImport={(input) =>
             runWizardImport(importSession.source, importSession.environmentId, input)
           }
