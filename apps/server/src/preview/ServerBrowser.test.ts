@@ -9,15 +9,20 @@ import {
   ThreadId,
   type PreviewAutomationSnapshot,
   type PreviewAutomationStatus,
+  type PreviewImportedCookie,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Redacted from "effect/Redacted";
 import * as Stream from "effect/Stream";
 import type { BrowserContext, Page } from "playwright-core";
 import { beforeEach, expect, vi } from "vite-plus/test";
@@ -68,6 +73,12 @@ function makeSession() {
       if (method === "Page.getNavigationHistory") return { currentIndex: 0, entries: [{}] };
       if (method === "Page.getLayoutMetrics") return { cssVisualViewport: { pageX: 0, pageY: 0 } };
       if (method === "Page.captureScreenshot") return { data: "ZnJhbWU=" };
+      if (method === "Network.setCookie") {
+        const cookie = _input as { name: string; value: string };
+        if (cookie.name === "rejected") return { success: false };
+        if (cookie.name === "throws") throw new Error(`Invalid cookie ${cookie.value}`);
+        return { success: true };
+      }
       return { result: { value: "evaluated" } };
     }),
   };
@@ -188,7 +199,7 @@ const asSession = (providerSessionId: string) => ({
   ...scope,
   thread: { ...testThread, providerSessionId },
 });
-const dependencies = Layer.mergeAll(
+const baseDependencies = Layer.mergeAll(
   Broker.layer,
   Manager.layer,
   Layer.succeed(ServerEnvironment.ServerEnvironment, {
@@ -232,11 +243,19 @@ const dependencies = Layer.mergeAll(
       ),
     pointer: () => Effect.void,
   }),
-).pipe(
+);
+const dependencies = baseDependencies.pipe(
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-server-browser-" })),
   Layer.provideMerge(NodeServices.layer),
 );
 const layer = ServerBrowser.layer.pipe(Layer.provideMerge(dependencies));
+/** A second server process over the same state directory. */
+const restartedLayer = (config: ServerConfig.ServerConfig["Service"]) =>
+  ServerBrowser.layer.pipe(
+    Layer.provideMerge(baseDependencies),
+    Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+    Layer.provideMerge(NodeServices.layer),
+  );
 const ready = Effect.gen(function* () {
   const browser = yield* ServerBrowser.ServerBrowser;
   const broker = yield* Broker.PreviewAutomationBroker;
@@ -1565,6 +1584,194 @@ it.live("a desktop page that comes back reconnects without waiting for a viewer"
       // Without a viewer or agent, the server drives the page again, so its URL keeps reaching clients.
       while (desktopConnections.length < 2) yield* Effect.yieldNow;
       expect(desktopConnections).toHaveLength(2);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+const SECRET = "synthetic-secret-cookie-value";
+const importedCookie = (over: Partial<PreviewImportedCookie> & { name: string }) =>
+  ({
+    url: "https://app.example.test/dash",
+    value: Redacted.make("v"),
+    path: "/dash",
+    secure: true,
+    httpOnly: true,
+    sameSite: "unspecified" as const,
+    ...over,
+  }) satisfies PreviewImportedCookie;
+const cookieCalls = () =>
+  contexts[0]!.sessions.flatMap((session) =>
+    session.send.mock.calls
+      .filter(([method]) => method === "Network.setCookie")
+      .map(([, input]) => input),
+  );
+
+it.live("importCookies keeps each cookie's scope, path, sameSite, and expiry", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const browser = yield* ServerBrowser.ServerBrowser;
+      const result = yield* browser.importCookies({
+        profileId: "profile-work",
+        cookies: [
+          importedCookie({
+            name: "hostOnly",
+            value: Redacted.make(SECRET),
+            sameSite: "lax",
+            expirationDate: 1_900_000_000,
+          }),
+          importedCookie({
+            name: "domain",
+            domain: ".example.test",
+            path: "/",
+            secure: false,
+            httpOnly: false,
+            sameSite: "no_restriction",
+          }),
+          importedCookie({ name: "strict", sameSite: "strict" }),
+        ],
+      });
+      expect(result).toEqual({ imported: 3, skipped: 0 });
+      expect(contextRequests).toEqual([{ profileId: "profile-work", isolated: false }]);
+      expect(cookieCalls()).toStrictEqual([
+        {
+          name: "hostOnly",
+          value: SECRET,
+          url: "https://app.example.test/dash",
+          path: "/dash",
+          secure: true,
+          httpOnly: true,
+          sameSite: "Lax",
+          expires: 1_900_000_000,
+        },
+        {
+          name: "domain",
+          value: "v",
+          domain: ".example.test",
+          path: "/",
+          secure: false,
+          httpOnly: false,
+          sameSite: "None",
+        },
+        {
+          name: "strict",
+          value: "v",
+          url: "https://app.example.test/dash",
+          path: "/dash",
+          secure: true,
+          httpOnly: true,
+          sameSite: "Strict",
+        },
+      ]);
+      expect(contexts[0]!.page.close).toHaveBeenCalled();
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("importCookies counts a rejected cookie as skipped and still writes the rest", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const browser = yield* ServerBrowser.ServerBrowser;
+      const result = yield* browser.importCookies({
+        profileId: "profile-work",
+        cookies: [
+          importedCookie({ name: "rejected" }),
+          importedCookie({ name: "throws", value: Redacted.make(SECRET) }),
+          importedCookie({ name: "kept" }),
+        ],
+      });
+      expect(result).toEqual({ imported: 1, skipped: 2 });
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("importCookies refuses the incognito profile without opening a browser", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const browser = yield* ServerBrowser.ServerBrowser;
+      const error = yield* browser
+        .importCookies({ profileId: "incognito", cookies: [importedCookie({ name: "sid" })] })
+        .pipe(Effect.flip);
+      expect(error).toMatchObject({
+        _tag: "PreviewImportCookiesError",
+        profileId: "incognito",
+        reason: "incognitoProfile",
+      });
+      expect(contextRequests).toEqual([]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("a failed or partly rejected import never puts a cookie value in logs or errors", () => {
+  const logs: string[] = [];
+  const logger = Logger.make(({ message, cause }) => {
+    logs.push(JSON.stringify([message, Cause.pretty(cause)]));
+  });
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const browser = yield* ServerBrowser.ServerBrowser;
+      const cookies = [importedCookie({ name: "throws", value: Redacted.make(SECRET) })];
+      yield* browser.importCookies({ profileId: "profile-work", cookies });
+      contextFailure = new Error("launch failed");
+      const error = yield* browser
+        .importCookies({ profileId: "profile-work", cookies })
+        .pipe(Effect.flip);
+      expect(error).toMatchObject({
+        _tag: "PreviewImportCookiesError",
+        reason: "browserUnavailable",
+      });
+      expect(
+        `${error.message} ${Cause.pretty(Cause.fail(error))} ${JSON.stringify(error)}`,
+      ).not.toContain(SECRET);
+      expect(logs.join("\n")).not.toContain(SECRET);
+    }),
+  ).pipe(
+    Effect.provide(layer),
+    Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+  );
+});
+
+it.live("the agent default outranks the reported one, survives a restart, and resets on null", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const browser = yield* ServerBrowser.ServerBrowser;
+      const broker = yield* Broker.PreviewAutomationBroker;
+      yield* Effect.yieldNow;
+      yield* browser.reportProfiles({
+        profiles: [{ id: "profile-work", name: "Work", kind: "persistent" }],
+        defaultProfileId: "profile-work",
+      });
+      const openWithoutProfile = (invoke: typeof broker.invoke) =>
+        invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "open",
+          input: { reuseExistingTab: false, show: false },
+        });
+      const lastContext = () => contextRequests.at(-1);
+
+      // The agent default is not in the reported list; it opens by id anyway.
+      yield* browser.setAgentDefaultProfile("profile-agent");
+      const status = yield* openWithoutProfile(broker.invoke);
+      expect(lastContext()).toEqual({ profileId: "profile-agent", isolated: false });
+      expect(status.defaultProfileId).toBe("profile-agent");
+
+      yield* browser.setAgentDefaultProfile(null);
+      yield* openWithoutProfile(broker.invoke);
+      expect(lastContext()).toEqual({ profileId: "profile-work", isolated: false });
+
+      yield* browser.setAgentDefaultProfile("profile-agent");
+      const restarted = yield* Layer.build(Layer.fresh(restartedLayer(config)));
+      const restartedBroker = Context.get(restarted, Broker.PreviewAutomationBroker);
+      yield* Effect.yieldNow;
+      yield* openWithoutProfile(restartedBroker.invoke);
+      expect(lastContext()).toEqual({ profileId: "profile-agent", isolated: false });
+
+      yield* Context.get(restarted, ServerBrowser.ServerBrowser).setAgentDefaultProfile(null);
+      const cleared = yield* Layer.build(Layer.fresh(restartedLayer(config)));
+      const clearedBroker = Context.get(cleared, Broker.PreviewAutomationBroker);
+      yield* Effect.yieldNow;
+      yield* openWithoutProfile(clearedBroker.invoke);
+      expect(lastContext()).toEqual({ profileId: "default", isolated: true });
     }),
   ).pipe(Effect.provide(layer)),
 );

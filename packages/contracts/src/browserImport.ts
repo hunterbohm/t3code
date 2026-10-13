@@ -105,6 +105,26 @@ export const BrowserImportSource = Schema.Struct({
 });
 export type BrowserImportSource = typeof BrowserImportSource.Type;
 
+/**
+ * A cookie read from a source browser, in the shape Electron's
+ * `session.cookies.set` and Chrome DevTools' `Network.setCookie` both take.
+ * `domain` is present only for domain cookies; a host-only cookie must leave it
+ * out or the receiving browser widens it to every subdomain.
+ */
+export const BrowserImportedCookie = Schema.Struct({
+  url: Schema.String,
+  name: Schema.String,
+  value: Schema.String,
+  domain: Schema.optional(Schema.String),
+  path: Schema.String,
+  secure: Schema.Boolean,
+  httpOnly: Schema.Boolean,
+  /** Seconds since the UNIX epoch; absent for a session cookie. */
+  expirationDate: Schema.optional(Schema.Number),
+  sameSite: Schema.Literals(["unspecified", "no_restriction", "lax", "strict"]),
+});
+export type BrowserImportedCookie = typeof BrowserImportedCookie.Type;
+
 export const BrowserImportInput = Schema.Struct({
   sourceId: BrowserImportSourceId,
   sourceProfileDirectory: TrimmedNonEmptyString,

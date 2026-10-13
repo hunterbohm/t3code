@@ -10,6 +10,7 @@
  */
 import { Schema } from "effect";
 import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { BrowserImportedCookie } from "./browserImport.ts";
 import { BROWSER_PROFILE_MAX_COUNT, BrowserProfile, BrowserProfileId } from "./browserProfile.ts";
 
 export const PREVIEW_URL_MAX_LENGTH = 2_048;
@@ -308,6 +309,39 @@ export const PreviewClearProfileInput = Schema.Struct({
 });
 export type PreviewClearProfileInput = typeof PreviewClearProfileInput.Type;
 
+export const PREVIEW_IMPORT_COOKIES_MAX_BATCH = 500;
+
+/** An imported cookie on the wire. The value is redacted so it cannot reach a log. */
+export const PreviewImportedCookie = Schema.Struct({
+  ...BrowserImportedCookie.fields,
+  value: Schema.Redacted(Schema.String),
+});
+export type PreviewImportedCookie = typeof PreviewImportedCookie.Type;
+
+/** Writes cookies read on the desktop into a profile's server-side browser storage. */
+export const PreviewImportCookiesInput = Schema.Struct({
+  profileId: BrowserProfileId,
+  cookies: Schema.Array(PreviewImportedCookie).check(
+    Schema.isMaxLength(PREVIEW_IMPORT_COOKIES_MAX_BATCH),
+  ),
+});
+export type PreviewImportCookiesInput = typeof PreviewImportCookiesInput.Type;
+
+export const PreviewImportCookiesResult = Schema.Struct({
+  imported: NonNegativeInt,
+  skipped: NonNegativeInt,
+});
+export type PreviewImportCookiesResult = typeof PreviewImportCookiesResult.Type;
+
+/**
+ * Which profile agents open when `preview_open` names none. Overrides the
+ * default a client reports, and survives server restarts. Null removes it.
+ */
+export const PreviewSetAgentDefaultProfileInput = Schema.Struct({
+  profileId: Schema.NullOr(BrowserProfileId),
+});
+export type PreviewSetAgentDefaultProfileInput = typeof PreviewSetAgentDefaultProfileInput.Type;
+
 export const PreviewListInput = Schema.Struct({
   threadId: ThreadId,
 });
@@ -449,6 +483,30 @@ export class PreviewClearProfileError extends Schema.TaggedError<PreviewClearPro
 ) {
   override get message() {
     return "The environment could not delete this browser profile's data.";
+  }
+}
+
+export class PreviewImportCookiesError extends Schema.TaggedError<PreviewImportCookiesError>()(
+  "PreviewImportCookiesError",
+  {
+    profileId: Schema.String,
+    reason: Schema.Literals(["incognitoProfile", "browserUnavailable"]),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message() {
+    return this.reason === "incognitoProfile"
+      ? "Incognito keeps no sign-ins, so there is nothing to import into."
+      : "The environment's browser could not take these sign-ins.";
+  }
+}
+
+export class PreviewSetAgentDefaultProfileError extends Schema.TaggedError<PreviewSetAgentDefaultProfileError>()(
+  "PreviewSetAgentDefaultProfileError",
+  { cause: Schema.Defect() },
+) {
+  override get message() {
+    return "The environment could not save the default browser profile for agents.";
   }
 }
 

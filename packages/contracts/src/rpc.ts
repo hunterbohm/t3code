@@ -261,6 +261,11 @@ import {
   PreviewListResult,
   PreviewClearProfileError,
   PreviewClearProfileInput,
+  PreviewImportCookiesError,
+  PreviewImportCookiesInput,
+  PreviewImportCookiesResult,
+  PreviewSetAgentDefaultProfileError,
+  PreviewSetAgentDefaultProfileInput,
   PreviewReportProfilesInput,
   PreviewNavigateInput,
   PreviewOpenInput,
@@ -458,6 +463,8 @@ export const WS_METHODS = {
   previewClose: "preview.close",
   previewList: "preview.list",
   previewClearProfile: "preview.clearProfile",
+  previewImportCookies: "preview.importCookies",
+  previewSetAgentDefaultProfile: "preview.setAgentDefaultProfile",
   previewReportProfiles: "preview.reportProfiles",
   previewReportStatus: "preview.reportStatus",
 
@@ -1538,6 +1545,17 @@ const WsPreviewClearProfileRpc = Rpc.make(WS_METHODS.previewClearProfile, {
   error: Schema.Union([PreviewClearProfileError, EnvironmentAuthorizationError]),
 });
 
+const WsPreviewImportCookiesRpc = Rpc.make(WS_METHODS.previewImportCookies, {
+  payload: PreviewImportCookiesInput,
+  success: PreviewImportCookiesResult,
+  error: Schema.Union([PreviewImportCookiesError, EnvironmentAuthorizationError]),
+});
+
+const WsPreviewSetAgentDefaultProfileRpc = Rpc.make(WS_METHODS.previewSetAgentDefaultProfile, {
+  payload: PreviewSetAgentDefaultProfileInput,
+  error: Schema.Union([PreviewSetAgentDefaultProfileError, EnvironmentAuthorizationError]),
+});
+
 const WsPreviewReportProfilesRpc = Rpc.make(WS_METHODS.previewReportProfiles, {
   payload: PreviewReportProfilesInput,
   error: EnvironmentAuthorizationError,
@@ -2036,6 +2054,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsPreviewCloseRpc,
   WsPreviewListRpc,
   WsPreviewClearProfileRpc,
+  WsPreviewImportCookiesRpc,
+  WsPreviewSetAgentDefaultProfileRpc,
   WsPreviewReportProfilesRpc,
   WsPreviewReportStatusRpc,
   WsSubscribePreviewEventsRpc,
