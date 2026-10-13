@@ -344,30 +344,24 @@ describe("forwarding cookies to environments", () => {
     expect(events).toContain("default:off");
   });
 
-  it("does not finish until every environment has acknowledged its default", async () => {
-    let acknowledge!: () => void;
-    const acknowledged = new Promise<void>((resolve) => {
-      acknowledge = resolve;
-    });
-    let finished = false;
+  it("reports a default that fails after the write started", async () => {
+    const started = Promise.withResolvers<void>();
+    const acknowledgement = Promise.withResolvers<void>();
     const done = syncDestinations({
       destinations: [destination("slow")],
       selected: new Set([env("slow")]),
       cookies: [],
       batchSize: 2,
       send: async () => ({ imported: 0, skipped: 0 }),
-      setDefault: () => acknowledged,
-    }).then((results) => {
-      finished = true;
-      return results;
+      setDefault: () => {
+        started.resolve();
+        return acknowledgement.promise;
+      },
     });
 
-    await Promise.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(finished).toBe(false);
-    acknowledge();
-    expect((await done)[0]?.defaultFailed).toBe(false);
-    expect(finished).toBe(true);
+    await started.promise;
+    acknowledgement.reject(new Error("connection lost"));
+    expect((await done)[0]?.defaultFailed).toBe(true);
   });
 });
 
