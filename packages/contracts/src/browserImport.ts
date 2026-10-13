@@ -133,14 +133,6 @@ export const BrowserImportInput = Schema.Struct({
 });
 export type BrowserImportInput = typeof BrowserImportInput.Type;
 
-/** IPC payload: the import input plus the environment the partition belongs to. */
-export const DesktopPreviewImportCookiesInputSchema = Schema.Struct({
-  environmentId: TrimmedNonEmptyString,
-  sourceId: BrowserImportSourceId,
-  sourceProfileDirectory: TrimmedNonEmptyString,
-  targetProfileId: BrowserProfileId,
-});
-
 export const BrowserImportResult = Schema.Struct({
   /** Cookies successfully written into the target partition. */
   imported: Schema.Int,
@@ -158,6 +150,27 @@ export const BrowserImportResult = Schema.Struct({
   skippedDomains: Schema.Array(Schema.String),
 });
 export type BrowserImportResult = typeof BrowserImportResult.Type;
+
+export const DesktopPreviewImportCookiesResultSchema = Schema.Struct({
+  ...BrowserImportResult.fields,
+  /** Present only when the request set `returnCookies`. */
+  cookies: Schema.optional(Schema.Array(BrowserImportedCookie)),
+});
+export type DesktopPreviewImportCookiesResult = typeof DesktopPreviewImportCookiesResultSchema.Type;
+
+/**
+ * IPC payload: the import input plus the environments whose partitions get the
+ * cookies. The source is read once however many partitions are written.
+ */
+export const DesktopPreviewImportCookiesInputSchema = Schema.Struct({
+  /** The first entry is the primary environment, whose counts the result reports. */
+  environmentIds: Schema.NonEmptyArray(TrimmedNonEmptyString),
+  sourceId: BrowserImportSourceId,
+  sourceProfileDirectory: TrimmedNonEmptyString,
+  targetProfileId: BrowserProfileId,
+  /** Also return the cookies read, so the renderer can forward them to servers. */
+  returnCookies: Schema.Boolean,
+});
 
 const BROWSER_IMPORT_UNAVAILABLE_COPY: Readonly<Record<BrowserImportUnavailableReason, string>> = {
   notInstalled: "Not installed on this machine.",

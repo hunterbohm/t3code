@@ -6,9 +6,9 @@
  */
 import type {
   BrowserImportInput,
-  BrowserImportResult,
   BrowserImportSource,
   BrowserImportUnavailableReason,
+  DesktopPreviewImportCookiesResult,
 } from "@t3tools/contracts";
 import { BrowserImportFailureReason } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -68,17 +68,27 @@ export class BrowserCookieWriteError extends Schema.TaggedError<BrowserCookieWri
   }
 }
 
+/** One environment's partition, derived by the caller in main. */
+export interface BrowserImportTarget {
+  readonly scope: string;
+  readonly persistent: boolean;
+  readonly namespace?: BrowserSession.BrowserSessionPartitionNamespace;
+}
+
 export class BrowserImport extends Context.Service<
   BrowserImport,
   {
     readonly listSources: Effect.Effect<ReadonlyArray<BrowserImportSource>>;
+    /**
+     * Reads the source once and writes the cookies into every target. The
+     * counts are the first target's. The cookies themselves come back only when
+     * `returnCookies` is set, for the renderer to forward to servers.
+     */
     readonly importCookies: (input: {
       readonly input: BrowserImportInput;
-      /** Partition scope of the target profile, derived by the caller in main. */
-      readonly scope: string;
-      readonly persistent: boolean;
-      readonly namespace?: BrowserSession.BrowserSessionPartitionNamespace;
-    }) => Effect.Effect<BrowserImportResult, BrowserImportFailedError>;
+      readonly targets: readonly [BrowserImportTarget, ...ReadonlyArray<BrowserImportTarget>];
+      readonly returnCookies: boolean;
+    }) => Effect.Effect<DesktopPreviewImportCookiesResult, BrowserImportFailedError>;
   }
 >()("@t3tools/desktop/preview/BrowserImport/BrowserImport") {}
 
@@ -194,12 +204,9 @@ export const make = Effect.gen(function* BrowserImportMake() {
     }),
   ).pipe(Effect.provide(platformServices));
 
-  const importCookies = Effect.fn("BrowserImport.importCookies")(function* (input: {
-    readonly input: BrowserImportInput;
-    readonly scope: string;
-    readonly persistent: boolean;
-    readonly namespace?: BrowserSession.BrowserSessionPartitionNamespace;
-  }) {
+  const importCookies = Effect.fn("BrowserImport.importCookies")(function* (
+    input: Parameters<BrowserImport["Service"]["importCookies"]>[0],
+  ) {
     const definition = BROWSER_IMPORT_SOURCES.find(
       (candidate) => candidate.id === input.input.sourceId,
     );
@@ -313,9 +320,8 @@ export const make = Effect.gen(function* BrowserImportMake() {
       }),
     );
 
-    const session = yield* browserSession
-      .getSession(input.scope, input.persistent, input.namespace)
-      .pipe(
+    const openSession = (target: BrowserImportTarget) =>
+      browserSession.getSession(target.scope, target.persistent, target.namespace).pipe(
         Effect.mapError(
           (cause) =>
             new BrowserImportFailedError({
@@ -325,10 +331,16 @@ export const make = Effect.gen(function* BrowserImportMake() {
             }),
         ),
       );
+    // Every partition opens before the first write, so a session that cannot
+    // open fails the import before any environment is left half-imported.
+    const primarySession = yield* openSession(input.targets[0]);
+    const otherSessions = yield* Effect.forEach(input.targets.slice(1), openSession);
 
     // Written one at a time rather than in parallel: Chromium's cookie store
     // serialises writes anyway, and a rejected cookie should only cost itself.
-    return yield* writeCookies(session, result);
+    const counts = yield* writeCookies(primarySession, result);
+    for (const session of otherSessions) yield* writeCookies(session, result);
+    return { ...counts, ...(input.returnCookies ? { cookies: result.cookies } : {}) };
   });
 
   return BrowserImport.of({ listSources, importCookies });
