@@ -1,6 +1,6 @@
 import { PermissionChecklist, PermissionContinueButton } from "../permissions/PermissionChecklist";
 import { usePermissionStatus } from "../permissions/usePermissionStatus";
-import type { BrowserImportSource } from "@t3tools/contracts";
+import type { BrowserImportSource, EnvironmentId } from "@t3tools/contracts";
 import { BROWSER_IMPORT_FAILURE_COPY } from "@t3tools/contracts";
 import { ArrowDownIcon, ArrowRightIcon, CheckIcon, HardDriveIcon } from "lucide-react";
 import { useRef, useState } from "react";
@@ -8,6 +8,7 @@ import { useRef, useState } from "react";
 import { cn, randomUUID } from "~/lib/utils";
 
 import { Button } from "../ui/button";
+import { Checkbox } from "../ui/checkbox";
 import {
   Dialog,
   DialogClose,
@@ -29,7 +30,11 @@ import {
   outcomeToStep,
   refreshedSourceProfileDirectory,
   refreshedSourceStep,
+  resolveMakeDefault,
   resolveWizardTarget,
+  selectedDestinations,
+  type EnvironmentImportResult,
+  type ImportDestination,
   type ImportOutcome,
   type WizardTarget,
   type WizardTargetProfile,
@@ -47,6 +52,8 @@ interface BrowserImportWizardProps {
   readonly targetProfiles: ReadonlyArray<WizardTargetProfile>;
   /** Whether a new profile can still be created (profile cap). */
   readonly canCreateProfile: boolean;
+  /** Environments with their own browser, which can be signed in too. */
+  readonly destinations: ReadonlyArray<ImportDestination>;
   /**
    * Runs the import and returns how it went. For a new target the caller only
    * registers the profile once the import succeeds, so a blocked attempt never
@@ -55,6 +62,9 @@ interface BrowserImportWizardProps {
   readonly onImport: (input: {
     readonly sourceProfileDirectory: string;
     readonly target: WizardTarget;
+    /** The destinations left on. */
+    readonly destinations: ReadonlyArray<ImportDestination>;
+    readonly makeDefault: boolean;
   }) => Promise<ImportOutcome>;
   /** Re-checks the source's availability after the user quits the browser. */
   readonly onRefreshSource: () => Promise<BrowserImportSource | undefined>;
@@ -76,6 +86,7 @@ export function BrowserImportWizard({
   destinationEnvironmentName,
   targetProfiles,
   canCreateProfile,
+  destinations,
   onImport,
   onRefreshSource,
   onOpenFullDiskAccessSettings,
@@ -91,6 +102,11 @@ export function BrowserImportWizard({
     initialTargetSelection(canCreateProfile, targetProfiles),
   );
   const [targetError, setTargetError] = useState<string>();
+  const [excludedDestinations, setExcludedDestinations] = useState<ReadonlySet<EnvironmentId>>(
+    () => new Set(),
+  );
+  const [makeDefaultChoice, setMakeDefaultChoice] = useState<boolean>();
+  const makeDefault = resolveMakeDefault(makeDefaultChoice, target);
   // Stable across retries so a keychain re-approval lands in one profile, not
   // a new one each time.
   const newProfileId = useRef(`profile-${randomUUID()}`);
@@ -111,7 +127,12 @@ export function BrowserImportWizard({
     setTargetError(undefined);
     importInFlight.current = true;
     setStep({ step: "importing" });
-    void onImport({ sourceProfileDirectory, target: chosen })
+    void onImport({
+      sourceProfileDirectory,
+      target: chosen,
+      destinations: selectedDestinations(destinations, excludedDestinations),
+      makeDefault,
+    })
       .then((outcome) => setStep(outcomeToStep(outcome)))
       .catch(() => setStep({ step: "blocked", reason: "readFailed" }))
       .finally(() => {
@@ -184,6 +205,18 @@ export function BrowserImportWizard({
             destinationEnvironmentName={destinationEnvironmentName}
             targetProfiles={targetProfiles}
             canCreateProfile={canCreateProfile}
+            destinations={destinations}
+            excludedDestinations={excludedDestinations}
+            onDestinationToggle={(environmentId, on) =>
+              setExcludedDestinations((current) => {
+                const next = new Set(current);
+                if (on) next.delete(environmentId);
+                else next.add(environmentId);
+                return next;
+              })
+            }
+            makeDefault={makeDefault}
+            onMakeDefaultChange={setMakeDefaultChoice}
             sourceProfileDirectory={sourceProfileDirectory}
             onSourceProfileChange={setSourceProfileDirectory}
             target={target}
@@ -244,6 +277,11 @@ type ConfigureStepProps = {
   readonly destinationEnvironmentName: string;
   readonly targetProfiles: ReadonlyArray<WizardTargetProfile>;
   readonly canCreateProfile: boolean;
+  readonly destinations: ReadonlyArray<ImportDestination>;
+  readonly excludedDestinations: ReadonlySet<EnvironmentId>;
+  readonly onDestinationToggle: (environmentId: EnvironmentId, on: boolean) => void;
+  readonly makeDefault: boolean;
+  readonly onMakeDefaultChange: (makeDefault: boolean) => void;
   readonly sourceProfileDirectory: string;
   readonly onSourceProfileChange: (directory: string) => void;
   readonly target: WizardTargetSelection;
@@ -344,6 +382,11 @@ function ConfigureStep({
   destinationEnvironmentName,
   targetProfiles,
   canCreateProfile,
+  destinations,
+  excludedDestinations,
+  onDestinationToggle,
+  makeDefault,
+  onMakeDefaultChange,
   sourceProfileDirectory,
   onSourceProfileChange,
   target,
@@ -418,6 +461,31 @@ function ConfigureStep({
             ))}
           </section>
         </div>
+        {destinations.length > 0 ? (
+          <section className="mt-4 space-y-2">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              Sign in agents on
+            </p>
+            {destinations.map((destination) => (
+              <label key={destination.environmentId} className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  checked={!excludedDestinations.has(destination.environmentId)}
+                  onCheckedChange={(checked) =>
+                    onDestinationToggle(destination.environmentId, checked === true)
+                  }
+                />
+                <span className="truncate">{destination.name}</span>
+              </label>
+            ))}
+          </section>
+        ) : null}
+        <label className="mt-4 flex items-center gap-2 text-sm">
+          <Checkbox
+            checked={makeDefault}
+            onCheckedChange={(checked) => onMakeDefaultChange(checked === true)}
+          />
+          Make this the default profile
+        </label>
         {targetFeedback ? (
           <p role="alert" className="mt-3 text-sm text-destructive">
             {targetFeedback}
@@ -534,6 +602,7 @@ function DoneStep({
   skipped,
   skippedDomains,
   targetName,
+  environments,
   destinationEnvironmentName,
   onClose,
 }: {
@@ -541,9 +610,13 @@ function DoneStep({
   readonly skipped: number;
   readonly skippedDomains: ReadonlyArray<string>;
   readonly targetName: string;
+  readonly environments: ReadonlyArray<EnvironmentImportResult>;
   readonly destinationEnvironmentName: string;
   readonly onClose: () => void;
 }) {
+  const environmentRows = environments.filter(
+    (result) => result.cookies !== "notSelected" || result.defaultFailed,
+  );
   return (
     <>
       <DialogHeader>
@@ -562,6 +635,38 @@ function DoneStep({
               : `There were no cookies to import for ${destinationEnvironmentName}.`}
         </DialogDescription>
       </DialogHeader>
+      {environmentRows.length > 0 ? (
+        <DialogPanel>
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Agents
+          </p>
+          <ul className="mt-1 space-y-1">
+            {environmentRows.map((result) => (
+              <li
+                key={result.environmentId}
+                className="flex items-center justify-between gap-3 text-sm"
+              >
+                <span className="truncate">{result.name}</span>
+                <span className="shrink-0 text-right tabular-nums">
+                  {result.cookies === "failed" ? (
+                    <span className="text-destructive">Couldn&rsquo;t import</span>
+                  ) : result.cookies === "notSelected" ? null : (
+                    <span className="text-muted-foreground">
+                      {cookieResultCount(result.cookies.imported)}
+                      {result.cookies.skipped > 0
+                        ? `, ${result.cookies.skipped.toLocaleString()} skipped`
+                        : ""}
+                    </span>
+                  )}
+                  {result.defaultFailed ? (
+                    <span className="ml-2 text-destructive">Default not set</span>
+                  ) : null}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </DialogPanel>
+      ) : null}
       {skippedDomains.length > 0 ? (
         <DialogPanel>
           <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">

@@ -10,6 +10,9 @@ import {
   resolveBrowserProfiles,
   type BrowserProfile,
   type PreviewReportProfilesInput,
+  type PreviewImportCookiesInput,
+  type PreviewImportCookiesResult,
+  type PreviewSetAgentDefaultProfileInput,
   PREVIEW_AUTOMATION_SERVER_OPERATIONS,
   PreviewViewportSetting as PreviewViewportSettingSchema,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
@@ -33,7 +36,10 @@ import {
   type PreviewAutomationTypeInput,
   type PreviewAutomationUploadInput,
   type PreviewAutomationWaitForInput,
+  BrowserProfileId,
   PreviewClearProfileError,
+  PreviewImportCookiesError,
+  PreviewSetAgentDefaultProfileError,
   type PreviewEvent,
   type PreviewNavStatus,
   type PreviewSessionSnapshot,
@@ -43,6 +49,7 @@ import {
   type PreviewAppearancePreference,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 import { normalizePreviewUrl } from "@t3tools/shared/preview";
 import { resolvePreviewViewport } from "@t3tools/shared/previewViewport";
 import * as NodeCrypto from "node:crypto";
@@ -57,7 +64,10 @@ import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import type * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import type {
@@ -80,6 +90,7 @@ import * as ServerBrowserPage from "./ServerBrowserPage.ts";
 import * as PreviewBrowser from "./PreviewBrowser.ts";
 import * as PreviewBrowserHost from "./PreviewBrowserHost.ts";
 import { presentAsChrome, ServerBrowserContexts } from "./ServerBrowserContexts.ts";
+import { writeImportedCookies } from "./ServerBrowserCookies.ts";
 import { BrowserControlInterrupted, SessionControl } from "./SessionControl.ts";
 
 const SERVER_HOST_CLIENT_ID = SERVER_BROWSER_AUTOMATION_CLIENT_ID;
@@ -250,6 +261,23 @@ export class ServerBrowser extends Context.Service<
      * clients report again on connect and whenever the list changes.
      */
     readonly reportProfiles: (input: PreviewReportProfilesInput) => Effect.Effect<void>;
+    /**
+     * Adds cookies to a human profile's storage, which headless tabs opened in
+     * that profile use. Existing cookies stay. A cookie the browser rejects is
+     * counted as skipped.
+     */
+    readonly importCookies: (
+      input: PreviewImportCookiesInput,
+    ) => Effect.Effect<PreviewImportCookiesResult, PreviewImportCookiesError>;
+    /**
+     * Sets the profile `preview_open` uses when the agent names none. Unlike a
+     * reported default, it is kept across restarts. Null removes it, and the
+     * reported default applies again. With `replacing`, nothing changes unless
+     * that profile is the stored default.
+     */
+    readonly setAgentDefaultProfile: (
+      input: PreviewSetAgentDefaultProfileInput,
+    ) => Effect.Effect<void, PreviewSetAgentDefaultProfileError>;
   }
 >()("t3/preview/ServerBrowser") {}
 
@@ -473,6 +501,10 @@ const CLIPBOARD_SCRIPT = `(() => {
     return result;
   };
 })();`;
+
+const AgentDefaultFile = Schema.fromJsonString(Schema.Struct({ profileId: BrowserProfileId }));
+const decodeAgentDefault = Schema.decodeUnknownEffect(AgentDefaultFile);
+const encodeAgentDefault = Schema.encodeSync(AgentDefaultFile);
 
 const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
@@ -1283,21 +1315,67 @@ const make = Effect.gen(function* () {
       };
     });
 
+  const fileSystem = yield* FileSystem.FileSystem;
+  const pathService = yield* Path.Path;
+  const agentDefaultPath = NodePath.join(config.stateDir, "server-browser", "agent-default.json");
+  /** The profile the user chose for agents. It outranks the client-reported default. */
+  let agentDefaultProfileId = yield* fileSystem.readFileString(agentDefaultPath).pipe(
+    Effect.flatMap(decodeAgentDefault),
+    Effect.map((stored): string | null => stored.profileId),
+    // A missing file is the normal first run.
+    Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(null)),
+    Effect.catch(() =>
+      Effect.logWarning("Ignoring an unreadable agent default browser profile.").pipe(
+        Effect.as(null),
+      ),
+    ),
+  );
+
+  const effectiveDefaultProfileId = () =>
+    agentDefaultProfileId ?? reportedProfiles?.defaultProfileId;
+
+  /** The file and the in-memory id change together, so concurrent calls cannot leave them apart. */
+  const agentDefaultLock = yield* Semaphore.make(1);
+
+  const setAgentDefaultProfile: ServerBrowser["Service"]["setAgentDefaultProfile"] = ({
+    profileId,
+    replacing,
+  }) =>
+    agentDefaultLock
+      .withPermits(1)(
+        Effect.suspend(() =>
+          replacing !== undefined && agentDefaultProfileId !== replacing
+            ? Effect.void
+            : (profileId === null
+                ? fileSystem.remove(agentDefaultPath, { force: true })
+                : writeFileStringAtomically({
+                    filePath: agentDefaultPath,
+                    contents: `${encodeAgentDefault({ profileId })}\n`,
+                  }).pipe(
+                    Effect.provideService(FileSystem.FileSystem, fileSystem),
+                    Effect.provideService(Path.Path, pathService),
+                  )
+              ).pipe(Effect.tap(() => Effect.sync(() => void (agentDefaultProfileId = profileId)))),
+        ),
+      )
+      .pipe(Effect.mapError((cause) => new PreviewSetAgentDefaultProfileError({ cause })));
+
   const profileStatus = () => {
     const profiles = reportedProfiles?.profiles ?? BUILT_IN_BROWSER_PROFILES;
+    const defaultProfileId = effectiveDefaultProfileId();
     return {
       profiles: profiles.map((profile) => ({
         id: profile.id,
         name: profile.name,
         ...(profile.kind === "incognito" ? { incognito: true } : {}),
       })),
-      ...(reportedProfiles ? { defaultProfileId: reportedProfiles.defaultProfileId } : {}),
+      ...(defaultProfileId === undefined ? {} : { defaultProfileId }),
     };
   };
 
-  /** Matches an id, then a case-insensitive name. Omitted means the reported default. */
+  /** Matches an id, then a case-insensitive name. Omitted means the agent default, else the reported one. */
   const resolveOpenProfile = (requested: string | undefined): string | undefined => {
-    if (requested === undefined) return reportedProfiles?.defaultProfileId;
+    if (requested === undefined) return effectiveDefaultProfileId();
     const profiles = reportedProfiles?.profiles ?? BUILT_IN_BROWSER_PROFILES;
     const wanted = requested.toLowerCase();
     const match =
@@ -2470,9 +2548,30 @@ const make = Effect.gen(function* () {
       catch: (cause) => new PreviewClearProfileError({ profileId, cause }),
     });
 
+  const importCookies: ServerBrowser["Service"]["importCookies"] = (input) =>
+    input.profileId === INCOGNITO_BROWSER_PROFILE_ID
+      ? Effect.fail(
+          new PreviewImportCookiesError({
+            profileId: input.profileId,
+            reason: "incognitoProfile",
+          }),
+        )
+      : Effect.tryPromise({
+          try: async () =>
+            writeImportedCookies(await contexts.contextFor(input.profileId), input.cookies),
+          catch: (cause) =>
+            new PreviewImportCookiesError({
+              profileId: input.profileId,
+              reason: "browserUnavailable",
+              cause,
+            }),
+        });
+
   return ServerBrowser.of({
     attachViewer,
     clearProfile,
+    importCookies,
+    setAgentDefaultProfile,
     reportProfiles,
     openDownload,
     answerFileChooser,

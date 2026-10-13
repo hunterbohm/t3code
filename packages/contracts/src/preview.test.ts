@@ -1,12 +1,15 @@
 import { Schema } from "effect";
+import * as Redacted from "effect/Redacted";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   ConfiguredLocalServerUrls,
   CONFIGURED_LOCAL_SERVER_URLS_MAX_ITEMS,
   DiscoveredLocalServer,
+  PREVIEW_IMPORT_COOKIES_MAX_BATCH,
   PREVIEW_URL_MAX_LENGTH,
   PreviewEvent,
+  PreviewImportCookiesInput,
   PreviewNavStatus,
   PreviewSessionSnapshot,
   PreviewViewportSetting,
@@ -360,5 +363,33 @@ describe("ConfiguredLocalServerUrls", () => {
     expect(() =>
       decodeConfiguredLocalServerUrls([`http://localhost/${"a".repeat(PREVIEW_URL_MAX_LENGTH)}`]),
     ).toThrow();
+  });
+});
+
+describe("PreviewImportCookiesInput", () => {
+  const SECRET = "synthetic-secret-value";
+  const cookie = {
+    url: "https://example.test/",
+    name: "sid",
+    value: Redacted.make(SECRET),
+    path: "/",
+    secure: true,
+    httpOnly: true,
+    sameSite: "lax" as const,
+  };
+  const codec = Schema.toCodecJson(PreviewImportCookiesInput);
+
+  it("carries the real value across the wire and decodes it redacted", () => {
+    const wire = Schema.encodeSync(codec)({ profileId: "work", cookies: [cookie] });
+    expect(JSON.stringify(wire)).toContain(SECRET);
+    const decoded = Schema.decodeSync(codec)(wire);
+    expect(Redacted.value(decoded.cookies[0]!.value)).toBe(SECRET);
+    expect(String(decoded.cookies[0]!.value)).not.toContain(SECRET);
+    expect(JSON.stringify(decoded)).not.toContain(SECRET);
+  });
+
+  it("rejects more cookies than one batch holds", () => {
+    const cookies = Array.from({ length: PREVIEW_IMPORT_COOKIES_MAX_BATCH + 1 }, () => cookie);
+    expect(() => Schema.encodeSync(codec)({ profileId: "work", cookies })).toThrow();
   });
 });

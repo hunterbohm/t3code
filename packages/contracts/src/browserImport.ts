@@ -105,6 +105,26 @@ export const BrowserImportSource = Schema.Struct({
 });
 export type BrowserImportSource = typeof BrowserImportSource.Type;
 
+/**
+ * A cookie read from a source browser, in the shape Electron's
+ * `session.cookies.set` and Chrome DevTools' `Network.setCookie` both take.
+ * `domain` is present only for domain cookies; a host-only cookie must leave it
+ * out or the receiving browser widens it to every subdomain.
+ */
+export const BrowserImportedCookie = Schema.Struct({
+  url: Schema.String,
+  name: Schema.String,
+  value: Schema.String,
+  domain: Schema.optional(Schema.String),
+  path: Schema.String,
+  secure: Schema.Boolean,
+  httpOnly: Schema.Boolean,
+  /** Seconds since the UNIX epoch; absent for a session cookie. */
+  expirationDate: Schema.optional(Schema.Number),
+  sameSite: Schema.Literals(["unspecified", "no_restriction", "lax", "strict"]),
+});
+export type BrowserImportedCookie = typeof BrowserImportedCookie.Type;
+
 export const BrowserImportInput = Schema.Struct({
   sourceId: BrowserImportSourceId,
   sourceProfileDirectory: TrimmedNonEmptyString,
@@ -112,14 +132,6 @@ export const BrowserImportInput = Schema.Struct({
   targetProfileId: BrowserProfileId,
 });
 export type BrowserImportInput = typeof BrowserImportInput.Type;
-
-/** IPC payload: the import input plus the environment the partition belongs to. */
-export const DesktopPreviewImportCookiesInputSchema = Schema.Struct({
-  environmentId: TrimmedNonEmptyString,
-  sourceId: BrowserImportSourceId,
-  sourceProfileDirectory: TrimmedNonEmptyString,
-  targetProfileId: BrowserProfileId,
-});
 
 export const BrowserImportResult = Schema.Struct({
   /** Cookies successfully written into the target partition. */
@@ -138,6 +150,27 @@ export const BrowserImportResult = Schema.Struct({
   skippedDomains: Schema.Array(Schema.String),
 });
 export type BrowserImportResult = typeof BrowserImportResult.Type;
+
+export const DesktopPreviewImportCookiesResultSchema = Schema.Struct({
+  ...BrowserImportResult.fields,
+  /** Present only when the request set `returnCookies`. */
+  cookies: Schema.optional(Schema.Array(BrowserImportedCookie)),
+});
+export type DesktopPreviewImportCookiesResult = typeof DesktopPreviewImportCookiesResultSchema.Type;
+
+/**
+ * IPC payload: the import input plus the environments whose partitions get the
+ * cookies. The source is read once however many partitions are written.
+ */
+export const DesktopPreviewImportCookiesInputSchema = Schema.Struct({
+  /** The first entry is the primary environment, whose counts the result reports. */
+  environmentIds: Schema.NonEmptyArray(TrimmedNonEmptyString),
+  sourceId: BrowserImportSourceId,
+  sourceProfileDirectory: TrimmedNonEmptyString,
+  targetProfileId: BrowserProfileId,
+  /** Also return the cookies read, so the renderer can forward them to servers. */
+  returnCookies: Schema.Boolean,
+});
 
 const BROWSER_IMPORT_UNAVAILABLE_COPY: Readonly<Record<BrowserImportUnavailableReason, string>> = {
   notInstalled: "Not installed on this machine.",

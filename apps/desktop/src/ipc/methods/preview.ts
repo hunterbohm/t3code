@@ -11,10 +11,10 @@ import {
   DesktopPreviewSetAudioMutedInputSchema,
   DesktopPreviewSetColorSchemeInputSchema,
   DesktopPreviewSetZoomFactorInputSchema,
-  BrowserImportResult,
   BrowserImportSource,
   DesktopPreviewClearDataInputSchema,
   DesktopPreviewImportCookiesInputSchema,
+  DesktopPreviewImportCookiesResultSchema,
   DesktopPreviewCreateTabInputSchema,
   DesktopPreviewTabInputSchema,
   DesktopPreviewWebviewConfigSchema,
@@ -340,23 +340,21 @@ export const listBrowserImportSources = DesktopIpc.makeIpcMethod({
 export const importBrowserCookies = DesktopIpc.makeIpcMethod({
   channel: IpcChannels.PREVIEW_IMPORT_COOKIES_CHANNEL,
   payload: DesktopPreviewImportCookiesInputSchema,
-  result: BrowserImportResult,
+  result: DesktopPreviewImportCookiesResultSchema,
   handler: Effect.fn("desktop.ipc.preview.importBrowserCookies")(function* ({
-    environmentId,
+    environmentIds,
+    returnCookies,
     ...importInput
   }) {
     const browserImport = yield* BrowserImport.BrowserImport;
     // Derived in main from the same helper the webview config uses, so cookies
     // land in exactly the partition the profile's tabs attach to.
-    const { scope, persistent, namespace } = resolvePartitionScope(
-      environmentId,
-      importInput.targetProfileId,
-    );
+    const partition = (environmentId: string) =>
+      resolvePartitionScope(environmentId, importInput.targetProfileId);
     return yield* browserImport.importCookies({
       input: importInput,
-      scope,
-      persistent,
-      ...(namespace === undefined ? {} : { namespace }),
+      targets: [partition(environmentIds[0]), ...environmentIds.slice(1).map(partition)],
+      returnCookies,
     });
   }),
 });

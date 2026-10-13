@@ -7,6 +7,10 @@ Open **Settings → Integrations → Browser profiles → Add profile**, then ch
 **Import from**. Close the source browser before importing, and allow an operating-system keyring
 unlock prompt if one appears.
 
+If other environments run their own browser, the wizard lists them under **Sign in agents on**.
+Each one you leave on receives the same sign-ins, so agents there are signed in too. Check
+**Make this the default profile** to have agents open this profile unless they name another.
+
 This is a one-time copy. Later login changes stay separate between the two browsers, and some
 sites may still require you to sign in again.
 

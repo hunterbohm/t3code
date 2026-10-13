@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vite-plus/test";
-import type { BrowserImportSource } from "@t3tools/contracts";
+import type { BrowserImportSource, EnvironmentId } from "@t3tools/contracts";
 
 import {
+  batchCookies,
   canCloseWizard,
+  desktopPartitionEnvironmentIds,
+  failedDestinationNames,
+  syncDestinations,
+  operableServerBrowserEnvironments,
+  resolveMakeDefault,
+  selectedDestinations,
   initialWizardStep,
   initialTargetSelection,
   isRetryableReason,
@@ -99,6 +106,7 @@ describe("outcomeToStep", () => {
         skipped: 3,
         skippedDomains: ["example.com"],
         targetName: "Work",
+        environments: [],
       }),
     ).toEqual({
       step: "done",
@@ -106,6 +114,7 @@ describe("outcomeToStep", () => {
       skipped: 3,
       skippedDomains: ["example.com"],
       targetName: "Work",
+      environments: [],
     });
   });
 
@@ -221,5 +230,153 @@ describe("formatSkippedDomains", () => {
     expect(formatSkippedDomains(["a.com", "b.com", "c.com", "d.com", "e.com"])).toBe(
       "a.com, b.com, c.com and 2 more",
     );
+  });
+});
+
+const env = (id: string) => id as EnvironmentId;
+const destination = (id: string) => ({ environmentId: env(id), name: id });
+
+describe("import destinations", () => {
+  it("offers only environments with a server browser this client may operate", () => {
+    const environments = ["local", "remote", "viewer-only", "no-browser"].map(destination);
+    expect(
+      operableServerBrowserEnvironments(
+        environments,
+        (id) => id !== "no-browser",
+        new Set([env("local"), env("remote"), env("no-browser")]),
+      ).map(({ environmentId }) => environmentId),
+    ).toEqual(["local", "remote"]);
+  });
+
+  it("writes the primary partition however the destinations are chosen", () => {
+    const destinations = ["primary", "remote"].map(destination);
+    expect(desktopPartitionEnvironmentIds(env("primary"), [])).toEqual(["primary"]);
+    expect(desktopPartitionEnvironmentIds(env("primary"), destinations)).toEqual([
+      "primary",
+      "remote",
+    ]);
+    expect(
+      desktopPartitionEnvironmentIds(
+        env("primary"),
+        selectedDestinations(destinations, new Set([env("primary")])),
+      ),
+    ).toEqual(["primary", "remote"]);
+  });
+
+  it("starts with every destination on", () => {
+    const destinations = ["a", "b"].map(destination);
+    expect(selectedDestinations(destinations, new Set())).toEqual(destinations);
+    expect(selectedDestinations(destinations, new Set([env("a")]))).toEqual([destination("b")]);
+  });
+});
+
+describe("resolveMakeDefault", () => {
+  it("defaults on for a new profile and off for an existing one", () => {
+    expect(resolveMakeDefault(undefined, { kind: "new" })).toBe(true);
+    expect(resolveMakeDefault(undefined, { kind: "existing", profileId: "work" })).toBe(false);
+  });
+
+  it("keeps the user's choice when the target changes", () => {
+    expect(resolveMakeDefault(false, { kind: "new" })).toBe(false);
+    expect(resolveMakeDefault(true, { kind: "existing", profileId: "work" })).toBe(true);
+  });
+});
+
+describe("forwarding cookies to environments", () => {
+  it("splits cookies into batches no larger than the limit", () => {
+    expect(batchCookies([1, 2, 3, 4, 5], 2)).toEqual([[1, 2], [3, 4], [5]]);
+    expect(batchCookies([], 2)).toEqual([]);
+  });
+
+  it("sums each environment's batches and fails only the one that rejects", async () => {
+    const sent: Array<[string, number]> = [];
+    const everyone = ["near", "far"].map(destination);
+    const results = await syncDestinations({
+      destinations: everyone,
+      selected: new Set(everyone.map(({ environmentId }) => environmentId)),
+      cookies: [1, 2, 3, 4, 5],
+      batchSize: 2,
+      send: async (environmentId, batch) => {
+        sent.push([environmentId, batch.length]);
+        if (environmentId === "far") throw new Error("unreachable");
+        return { imported: batch.length - 1, skipped: 1 };
+      },
+      setDefault: undefined,
+    });
+
+    expect(results).toEqual([
+      { ...destination("near"), cookies: { imported: 2, skipped: 3 }, defaultFailed: false },
+      { ...destination("far"), cookies: "failed", defaultFailed: false },
+    ]);
+    expect(sent.filter(([id]) => id === "near")).toEqual([
+      ["near", 2],
+      ["near", 2],
+      ["near", 1],
+    ]);
+    expect(sent.filter(([id]) => id === "far")).toEqual([["far", 2]]);
+  });
+
+  it("sets the default on every environment, after its cookies, and reports only the failures", async () => {
+    const events: string[] = [];
+    const everyone = ["on", "off", "down"].map(destination);
+    const results = await syncDestinations({
+      destinations: everyone,
+      selected: new Set([env("on"), env("down")]),
+      cookies: [1],
+      batchSize: 2,
+      send: async (environmentId) => {
+        events.push(`cookies:${environmentId}`);
+        return { imported: 1, skipped: 0 };
+      },
+      setDefault: async (environmentId) => {
+        events.push(`default:${environmentId}`);
+        if (environmentId === "down") throw new Error("unreachable");
+      },
+    });
+
+    expect(results).toEqual([
+      { ...destination("on"), cookies: { imported: 1, skipped: 0 }, defaultFailed: false },
+      { ...destination("off"), cookies: "notSelected", defaultFailed: false },
+      { ...destination("down"), cookies: { imported: 1, skipped: 0 }, defaultFailed: true },
+    ]);
+    expect(events.indexOf("cookies:on")).toBeLessThan(events.indexOf("default:on"));
+    expect(events.indexOf("cookies:down")).toBeLessThan(events.indexOf("default:down"));
+    expect(events).toContain("default:off");
+  });
+
+  it("reports a default that fails after the write started", async () => {
+    const started = Promise.withResolvers<void>();
+    const acknowledgement = Promise.withResolvers<void>();
+    const done = syncDestinations({
+      destinations: [destination("slow")],
+      selected: new Set([env("slow")]),
+      cookies: [],
+      batchSize: 2,
+      send: async () => ({ imported: 0, skipped: 0 }),
+      setDefault: () => {
+        started.resolve();
+        return acknowledgement.promise;
+      },
+    });
+
+    await started.promise;
+    acknowledgement.reject(new Error("connection lost"));
+    expect((await done)[0]?.defaultFailed).toBe(true);
+  });
+});
+
+describe("failedDestinationNames", () => {
+  it("awaits every environment and names the ones that rejected", async () => {
+    const reached: string[] = [];
+    const failed = await failedDestinationNames(
+      ["a", "b", "c"].map(destination),
+      async (environmentId) => {
+        await Promise.resolve();
+        reached.push(environmentId);
+        if (environmentId !== "b") throw new Error("down");
+      },
+    );
+    expect(failed).toEqual(["a", "c"]);
+    expect(reached.toSorted()).toEqual(["a", "b", "c"]);
   });
 });

@@ -4,7 +4,7 @@ import { SnapShotSource } from "./chatAttachment.ts";
 import { EnvironmentId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { BrowserProfileId } from "./browserProfile.ts";
 import type {
-  BrowserImportResult,
+  DesktopPreviewImportCookiesResult,
   BrowserImportSource,
   BrowserImportSourceId,
 } from "./browserImport.ts";
@@ -1314,12 +1314,19 @@ export interface DesktopPreviewBridge {
   ) => Promise<DesktopPreviewWebviewConfig>;
   /** Browsers on this machine whose cookies can be imported. */
   listBrowserImportSources: () => Promise<ReadonlyArray<BrowserImportSource>>;
+  /**
+   * Reads one browser's cookies and writes them into the profile's partition
+   * for each environment, the first being the primary. With `returnCookies`
+   * the cookies come back too, for forwarding to environments that run their
+   * own browser.
+   */
   importBrowserCookies: (input: {
-    readonly environmentId: EnvironmentId;
+    readonly environmentIds: readonly [EnvironmentId, ...ReadonlyArray<EnvironmentId>];
     readonly sourceId: BrowserImportSourceId;
     readonly sourceProfileDirectory: string;
     readonly targetProfileId: string;
-  }) => Promise<BrowserImportResult>;
+    readonly returnCookies: boolean;
+  }) => Promise<DesktopPreviewImportCookiesResult>;
   setAnnotationTheme: (theme: DesktopPreviewAnnotationTheme) => Promise<void>;
   /** Keep an open annotation picker's send shortcut in sync with its thread grant. */
   setAnnotationSendEnabled: (tabId: string, enabled: boolean) => Promise<void>;
